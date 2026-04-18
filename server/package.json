@@ -1,0 +1,13 @@
+{
+  "name": "brainrot-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Localhost receiver for the brainrot-filter POC userscript.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "youtubei.js": "^17.0.1"
+  }
+}
