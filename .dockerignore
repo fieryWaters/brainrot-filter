@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.DS_Store
+node_modules
+server/node_modules
+server/ingest-log
+server/transcript
+userscript
+sync-userscript.sh
+README.md

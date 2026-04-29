@@ -1,0 +1,11 @@
+services:
+  server:
+    build: .
+    container_name: brainrot-server
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    volumes:
+      - ./server/ingest-log:/app/ingest-log
+    restart: unless-stopped

@@ -9,9 +9,16 @@ const execFileP = promisify(execFile);
 const PORT = 8787;
 const LOG_DIR = path.join(__dirname, "ingest-log");
 const TRANSCRIPT_DIR = path.join(__dirname, "transcript");
-const OLLAMA_URL = "http://100.106.166.101:11434/api/generate";
-const OLLAMA_MODEL = "qwen3.5:9b";
-const OLLAMA_TIMEOUT_MS = 120000;
+
+const OLLAMA_URL = (process.env.OLLAMA_URL || "").trim();
+const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "qwen3.5:9b").trim();
+const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
+const OPENROUTER_MODEL = (process.env.OPENROUTER_MODEL || "qwen/qwen3.5-9b").trim();
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const LLM_TIMEOUT_MS = 120000;
+
+const PROVIDER = OLLAMA_URL ? "ollama" : (OPENROUTER_API_KEY ? "openrouter" : "none");
+
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
 const CORS = {
@@ -58,17 +65,26 @@ async function fetchTranscriptPy(videoId) {
     return value;
 }
 
-async function scoreWithOllama(text) {
-    const prompt = `You score a YouTube transcript for "brainrot" on a 0-100 scale. Brainrot = low-effort, hyper-stimulating, addictive content: Gen-Z slang overload (skibidi, rizz, sigma, no cap, etc.), empty filler, clickbait hype, mindless repetition, reaction-bait. Educational, technical, documentary, tutorial, artistic, and thoughtful content scores LOW even if casual. Calm narration scores low. 0 = serious educational. 50 = casual vlog. 100 = pure slop.
+const SCORING_RULES = `You score a YouTube transcript for "brainrot" on a 0-100 scale. Brainrot = low-effort, hyper-stimulating, addictive content: Gen-Z slang overload (skibidi, rizz, sigma, no cap, etc.), empty filler, clickbait hype, mindless repetition, reaction-bait. Educational, technical, documentary, tutorial, artistic, and thoughtful content scores LOW even if casual. Calm narration scores low. 0 = serious educational. 50 = casual vlog. 100 = pure slop.
 
-Respond with ONLY a single integer 0-100. No words, no explanation.
+Respond with ONLY a single integer 0-100. No words, no explanation.`;
+
+function parseScore(raw) {
+    const cleaned = (raw || "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    const m = cleaned.match(/\b(\d{1,3})\b/);
+    if (!m) throw new Error(`no number in: ${cleaned.slice(0, 100)}`);
+    return Math.max(0, Math.min(100, parseInt(m[1], 10)));
+}
+
+async function scoreWithOllama(text) {
+    const prompt = `${SCORING_RULES}
 
 TRANSCRIPT:
 ${text.slice(0, 80000)}
 
 SCORE:`;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
     try {
         const res = await fetch(OLLAMA_URL, {
             method: "POST",
@@ -84,13 +100,51 @@ SCORE:`;
         });
         if (!res.ok) throw new Error(`ollama http ${res.status}`);
         const data = await res.json();
-        const raw = (data.response || "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-        const m = raw.match(/\b(\d{1,3})\b/);
-        if (!m) throw new Error(`no number in: ${raw.slice(0, 100)}`);
-        return Math.max(0, Math.min(100, parseInt(m[1], 10)));
+        return parseScore(data.response);
     } finally {
         clearTimeout(timer);
     }
+}
+
+async function scoreWithOpenRouter(text) {
+    if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY not set");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    try {
+        const res = await fetch(OPENROUTER_URL, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                model: OPENROUTER_MODEL,
+                messages: [
+                    { role: "system", content: SCORING_RULES },
+                    { role: "user", content: `TRANSCRIPT:\n${text.slice(0, 80000)}\n\nSCORE:` },
+                ],
+                temperature: 0.2,
+                max_tokens: 24,
+                reasoning: { enabled: false },
+            }),
+            signal: controller.signal,
+        });
+        if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            throw new Error(`openrouter http ${res.status}: ${body.slice(0, 200)}`);
+        }
+        const data = await res.json();
+        const content = data?.choices?.[0]?.message?.content || "";
+        return parseScore(content);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function scoreLLM(text) {
+    if (PROVIDER === "ollama") return { score: await scoreWithOllama(text), scorer: "ollama" };
+    if (PROVIDER === "openrouter") return { score: await scoreWithOpenRouter(text), scorer: "openrouter" };
+    throw new Error("no LLM provider configured (set OPENROUTER_API_KEY or OLLAMA_URL)");
 }
 
 function scoreCaptions(captions) {
@@ -181,12 +235,13 @@ const server = http.createServer(async (req, res) => {
         let scorer = "keyword";
         try {
             const t0 = Date.now();
-            score = await scoreWithOllama(text);
-            scorer = "ollama";
-            console.log(`[score] ollama=${score} in ${Date.now() - t0}ms (${text.length} chars)`);
+            const result = await scoreLLM(text);
+            score = result.score;
+            scorer = result.scorer;
+            console.log(`[score] ${scorer}=${score} in ${Date.now() - t0}ms (${text.length} chars)`);
         } catch (e) {
             score = scoreCaptions(captions);
-            console.log(`[score] ollama failed (${e.message.slice(0, 120)}), fallback keyword=${score}`);
+            console.log(`[score] llm failed (${e.message.slice(0, 120)}), fallback keyword=${score}`);
         }
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const file = path.join(LOG_DIR, `${stamp}_${safeFilename(videoId)}.json`);
@@ -205,7 +260,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-    console.log(`brainrot server listening on http://0.0.0.0:${PORT} (tailscale: 100.94.9.65)`);
+    let providerLine;
+    if (PROVIDER === "ollama") providerLine = `provider=ollama url=${OLLAMA_URL} model=${OLLAMA_MODEL}`;
+    else if (PROVIDER === "openrouter") providerLine = `provider=openrouter model=${OPENROUTER_MODEL}`;
+    else providerLine = `provider=NONE (set OPENROUTER_API_KEY or OLLAMA_URL) - will fall back to keyword scoring`;
+    console.log(`brainrot server listening on http://0.0.0.0:${PORT}`);
+    console.log(providerLine);
     console.log(`ingest logs -> ${LOG_DIR}`);
-    console.log(`python transcript helper -> ${TRANSCRIPT_DIR}`);
 });

@@ -2,27 +2,29 @@
 
 Proof of concept for a YouTube "brainrot score" overlay. A Safari userscript
 extracts the full transcript of the current video from the browser, sends it
-to a local Node server, which forwards it to a self-hosted LLM for scoring
-0-100, and paints the score as a badge on the video player. Runs on Mac and
-iPhone over Tailscale.
+to a small Node server (running in Docker), which forwards it to an LLM for
+scoring 0-100, and paints the score as a badge on the video player.
+
+Default LLM provider is OpenRouter (cloud, requires only an API key). The
+server can also be pointed at a self-hosted Ollama instance via env var.
 
 ---
 
 ## Architecture
 
 ```
-[Safari userscript]  --transcript-->  [Mac Node server]  --prompt-->  [spark LLM]
-   (Mac or iPhone)      8787                                             11434
-      |                                                                   |
-      `------------------- score (0-100) <-----------------------------'
+[Safari userscript]  --transcript-->  [Node server (Docker)]  --prompt-->  [LLM provider]
+                                          0.0.0.0:8787                     OpenRouter | Ollama
+      |                                                                        |
+      `------------------------ score (0-100) <-----------------------------'
 ```
 
 | Piece               | Where                              | Role                                                                 |
 |---------------------|------------------------------------|----------------------------------------------------------------------|
 | Userscript          | Safari (Mac + iPhone)              | Reads video metadata, fetches transcript via YouTube InnerTube       |
-| Node server         | Mac, bound `0.0.0.0:8787`          | Receives transcript, calls LLM, logs JSON, returns score             |
-| Ollama + qwen3.5:9b | `spark` (Linux box on Tailscale)   | Scores a transcript 0-100                                            |
-| Tailscale           | All devices                        | Private network glue so the phone reaches the Mac, Mac reaches spark |
+| Node server         | Docker container, port 8787        | Receives transcript, calls LLM, logs JSON, returns score             |
+| OpenRouter (default)| https://openrouter.ai              | Scores a transcript 0-100 (model: `qwen/qwen3.5-9b` by default)      |
+| Ollama (optional)   | self-hosted, e.g. via Tailscale    | Same role, different provider                                        |
 
 ### Transcript fetch path
 
@@ -40,48 +42,25 @@ residential IP - not from a cloud server that would be blanket-blocked.
 
 ---
 
-## Setup
-
-### 1. LLM on spark
-
-Requires Ollama installed and listening on the Tailscale interface:
+## Quick start (Docker)
 
 ```
-ssh spark 'ollama pull qwen3.5:9b'
+git clone <this repo>
+cd brainrot-filter
+cp .env.example .env
+# edit .env and set OPENROUTER_API_KEY
+docker compose up --build
 ```
 
-Verify reachable from the Mac:
-
-```
-curl -s http://100.106.166.101:11434/api/tags | head
-```
-
-### 2. Node server on the Mac
-
-```
-cd server
-node index.js
-```
-
-Bind is `0.0.0.0:8787` so phones on Tailscale can reach it. Stdlib only, no
-npm install. Logs each ingest and writes a full JSON record to
-`server/ingest-log/`.
-
-Sanity:
+The server listens on `http://0.0.0.0:8787`. Sanity check:
 
 ```
 curl http://localhost:8787/health
-curl http://100.94.9.65:8787/health   # from any tailscale device
 ```
 
-Tailscale **Shields Up** must be off on the Mac, otherwise incoming tailscale
-traffic is silently dropped:
+Then install the userscript in Safari (see below) and open a YouTube video.
 
-```
-/Applications/Tailscale.app/Contents/MacOS/Tailscale set --shields-up=false
-```
-
-### 3. Userscript on Mac Safari
+### Userscript on Mac Safari
 
 After editing `userscript/brainrot.user.js`:
 
@@ -90,19 +69,21 @@ After editing `userscript/brainrot.user.js`:
 ```
 
 Click the Userscripts toolbar icon in Safari and hit Refresh so the extension
-re-scans. The script is hardcoded to `http://100.94.9.65:8787` (Mac's
-tailscale IP) so the same script works from Mac and iPhone.
+re-scans. `SERVER` is set to `http://localhost:8787` by default.
 
-### 4. Userscript on iPhone Safari
+### Userscript on iPhone Safari
 
 1. Install **Userscripts** from the App Store (same dev as the Mac app).
 2. Settings -> Safari -> Extensions -> Userscripts -> toggle on, set
    Permissions -> All Websites -> Allow.
-3. Open the Userscripts app, tap `+`, paste the contents of
+3. Edit `userscript/brainrot.user.js` and change `SERVER` to the address of
+   the machine running Docker (e.g. its LAN IP or Tailscale IP). Also add
+   that host to the `// @connect` directives at the top of the script.
+4. Open the Userscripts app, tap `+`, paste the contents of
    `userscript/brainrot.user.js`. Save.
-4. In Safari, browse to a YouTube video. Badge appears on the player.
+5. In Safari, browse to a YouTube video. Badge appears on the player.
 
-### 5. Making iOS airtight (Screen Time lock)
+### Locking the iOS extension (Screen Time)
 
 Once the userscript is installed and working, the extension can be locked in
 place so a user cannot disable it without the Screen Time passcode.
@@ -118,8 +99,60 @@ Effect: once Web Content is not *Unrestricted*, the Safari Extensions
 management UI requires the Screen Time passcode to toggle extensions off.
 Userscripts stays enabled and the brainrot badge stays active.
 
-To reverse: Settings -> Screen Time -> Content & Privacy Restrictions ->
-enter passcode -> revert Web Content to Unrestricted.
+---
+
+## Configuration
+
+All config is in `.env` (see `.env.example`):
+
+| Var                  | Required? | Default                | Notes                                       |
+|----------------------|-----------|------------------------|---------------------------------------------|
+| `OPENROUTER_API_KEY` | yes*      | -                      | Required unless `OLLAMA_URL` is set         |
+| `OPENROUTER_MODEL`   | no        | `qwen/qwen3.5-9b`      | Any OpenRouter model id                     |
+| `OLLAMA_URL`         | no        | -                      | If set, Ollama is used and OpenRouter is ignored |
+| `OLLAMA_MODEL`       | no        | `qwen3.5:9b`           | Only used when `OLLAMA_URL` is set          |
+
+If neither provider is configured (or both fail), the server falls back to a
+small keyword-density scorer so the pipeline still returns a number.
+
+---
+
+## Advanced: self-hosted Ollama via Tailscale
+
+If you have an Ollama box on your Tailnet (or LAN) you can route scoring
+there instead of OpenRouter. In `.env`:
+
+```
+OLLAMA_URL=http://100.106.166.101:11434/api/generate
+OLLAMA_MODEL=qwen3.5:9b
+```
+
+Then `docker compose up --build` again. The Docker container reaches the
+Tailscale IP through the host's network (Tailscale runs on the host, not in
+the container).
+
+For iPhone use: install Tailscale on the phone, then point the userscript's
+`SERVER` constant at the Mac's Tailscale IP. Also make sure Tailscale
+**Shields Up** is off on the Mac:
+
+```
+/Applications/Tailscale.app/Contents/MacOS/Tailscale set --shields-up=false
+```
+
+---
+
+## Repo layout
+
+```
+Dockerfile                    Server image (node:20-alpine, stdlib only)
+docker-compose.yml            Single service on port 8787
+.env.example                  Provider config template
+userscript/brainrot.user.js   Safari Userscripts source of truth
+server/index.js               Node server, http://0.0.0.0:8787
+server/ingest-log/            One JSON file per ingested video (gitignored, bind-mounted from container)
+server/transcript/            Python fallback (currently disabled in code)
+sync-userscript.sh            Copy userscript to Mac extension container
+```
 
 ---
 
@@ -147,8 +180,6 @@ are what a real version would look like:
   chaotic visuals still scores low.
 - Videos without captions score nothing. We would need audio transcription
   (Whisper) to cover them.
-- Everything is on a private Tailscale network. If the Mac sleeps the phone
-  stops getting scores.
 - Install on iOS is five manual steps. Not shippable to normal users.
 - AI scores are not consistent run-to-run - same video might score 22, 28,
   25. Fine for a badge, not for hard blocking.
@@ -158,8 +189,6 @@ are what a real version would look like:
 
 - Convert the userscript into a proper Safari App Store extension (wrapped
   in a macOS/iOS container app, Apple review).
-- Move scoring from the home LLM to a cloud-hosted LLM provider (~$0.001
-  per video at current prices).
 - Cache scores keyed by video ID so repeat viewers do not re-score. Cuts
   LLM cost roughly 90%.
 - Visual scoring: sample a handful of video frames, detect overlay text,
@@ -187,15 +216,3 @@ are what a real version would look like:
    confirmed. Mobile YouTube player DOM differs from desktop and the badge
    element may attach to a player element that later re-mounts, leaving the
    badge orphaned. Needs a mobile-specific rendering path.
-
----
-
-## Repo layout
-
-```
-userscript/brainrot.user.js   Safari Userscripts source of truth
-server/index.js               Node server, http://0.0.0.0:8787
-server/ingest-log/            One JSON file per ingested video (gitignored)
-server/transcript/            Python fallback (currently disabled in code)
-sync-userscript.sh            Copy userscript to Mac extension container
-```

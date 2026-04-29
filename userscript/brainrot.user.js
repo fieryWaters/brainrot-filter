@@ -15,7 +15,8 @@
 (function () {
     "use strict";
 
-    const SERVER = "http://100.94.9.65:8787";
+    // Change this if the server runs on another machine (e.g. tailscale IP for iPhone use).
+    const SERVER = "http://localhost:8787";
     const BADGE_ID = "brainrot-score-badge";
     const STATUS_ID = "brainrot-status-badge";
     const CAPTURE_DURATION_MS = 30000;

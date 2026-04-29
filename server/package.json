@@ -4,10 +4,10 @@
   "private": true,
   "description": "Localhost receiver for the brainrot-filter POC userscript.",
   "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node index.js"
-  },
-  "dependencies": {
-    "youtubei.js": "^17.0.1"
   }
 }
