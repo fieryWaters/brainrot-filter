@@ -9,18 +9,21 @@
 // @grant        GM_xmlhttpRequest
 // @connect      localhost
 // @connect      127.0.0.1
-// @connect      100.94.9.65
+// @connect      192.168.2.52
 // ==/UserScript==
 
 (function () {
     "use strict";
 
-    const SERVER = "http://100.94.9.65:8787";
+    // Set this to your laptop's LAN IP so iPhone can reach it on the same WiFi
+    const SERVER = "http://192.168.2.52:8787";
     const BADGE_ID = "brainrot-score-badge";
     const STATUS_ID = "brainrot-status-badge";
+    const BLOCK_ID = "brainrot-block-overlay";
     const CAPTURE_DURATION_MS = 30000;
     const POLL_INTERVAL_MS = 250;
     const CC_SETTLE_MS = 1500;
+    const DEFAULT_CONFIG = { threshold: 999, action: "blur", allowOverride: true };
 
     let lastVideoId = null;
     let captureAbort = null;
@@ -65,6 +68,8 @@
     function getVideoId() {
         const u = new URL(location.href);
         if (u.pathname === "/watch") return u.searchParams.get("v");
+        const shorts = u.pathname.match(/^\/shorts\/([a-zA-Z0-9_-]+)/);
+        if (shorts) return shorts[1];
         return null;
     }
 
@@ -94,8 +99,27 @@
         };
     }
 
+    function getPlayer() {
+        // Desktop YouTube
+        const desktop = document.querySelector(".html5-video-player");
+        if (desktop) return desktop;
+        // Mobile YouTube / Shorts — walk up from the video element to find a sized container
+        const video = document.querySelector("video");
+        if (!video) return null;
+        let el = video.parentElement;
+        while (el && el !== document.body) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 100 && r.height > 100) {
+                if (getComputedStyle(el).position === "static") el.style.position = "relative";
+                return el;
+            }
+            el = el.parentElement;
+        }
+        return video.parentElement;
+    }
+
     function setStatus(text, color) {
-        const player = document.querySelector(".html5-video-player");
+        const player = getPlayer();
         if (!player) return;
         let el = document.getElementById(STATUS_ID);
         if (!el) {
@@ -120,7 +144,7 @@
     }
 
     function showScore(score) {
-        const player = document.querySelector(".html5-video-player");
+        const player = getPlayer();
         if (!player) return;
         let el = document.getElementById(BADGE_ID);
         if (!el) {
@@ -155,6 +179,95 @@
     function clearOverlays() {
         document.getElementById(BADGE_ID)?.remove();
         document.getElementById(STATUS_ID)?.remove();
+        document.getElementById(BLOCK_ID)?.remove();
+    }
+
+    function serverGet(path, timeout = 5000) {
+        return new Promise((resolve, reject) => {
+            if (!GM_XHR) return reject(new Error("GM.xmlHttpRequest unavailable"));
+            GM_XHR({
+                method: "GET",
+                url: `${SERVER}${path}`,
+                timeout,
+                onload: (res) => {
+                    if (res.status < 200 || res.status >= 300) return reject(new Error(`server ${res.status}`));
+                    try { resolve(JSON.parse(res.responseText)); }
+                    catch (_) { resolve({}); }
+                },
+                onerror: (e) => reject(new Error(e?.error || "network error")),
+                ontimeout: () => reject(new Error("timeout")),
+            });
+        });
+    }
+
+    async function fetchConfig() {
+        try {
+            const result = await serverGet("/config", 5000);
+            return result || DEFAULT_CONFIG;
+        } catch (_) {
+            return DEFAULT_CONFIG; // server unreachable → don't block anything
+        }
+    }
+
+    function applyBlock(score, config, video, holdInterval) {
+        const player = getPlayer();
+        if (!player) return;
+
+        video = video || document.querySelector("video.html5-main-video, video");
+        if (video) { video.pause(); video.muted = true; video.style.filter = "blur(20px)"; video.style.opacity = "0.4"; }
+
+        let overlay = document.getElementById(BLOCK_ID);
+        if (!overlay) {
+            overlay = document.createElement("div");
+            overlay.id = BLOCK_ID;
+            Object.assign(overlay.style, {
+                position: "absolute",
+                inset: "0",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "rgba(0,0,0,0.82)",
+                color: "#fff",
+                zIndex: "70",
+                textAlign: "center",
+                padding: "24px",
+                boxSizing: "border-box",
+            });
+            player.appendChild(overlay);
+        }
+
+        const hue = Math.round(120 - (score / 100) * 120);
+        const scoreColor = `hsl(${hue}, 80%, 50%)`;
+        const actionLabel = config.action === "block" ? "Blocked" : "Blurred";
+
+        overlay.innerHTML = `
+            <div style="font:700 42px -apple-system,sans-serif;color:${scoreColor};line-height:1">${score}</div>
+            <div style="font:600 13px -apple-system,sans-serif;opacity:0.6;margin:4px 0 16px;letter-spacing:.05em">BRAINROT SCORE</div>
+            <div style="font:500 15px -apple-system,sans-serif;max-width:320px;line-height:1.5">
+                ${actionLabel}: this content scored above your threshold (${config.threshold}/100).
+            </div>
+            ${config.allowOverride ? `
+            <button id="brainrot-override-btn" style="
+                margin-top:20px;padding:10px 24px;
+                background:rgba(255,255,255,0.15);border:1px solid rgba(255,255,255,0.3);
+                color:#fff;border-radius:8px;font:600 14px -apple-system,sans-serif;
+                cursor:pointer;-webkit-tap-highlight-color:transparent
+            ">Watch anyway</button>` : ""}
+        `;
+
+        if (config.allowOverride) {
+            document.getElementById("brainrot-override-btn")?.addEventListener("click", () => {
+                overlay.remove();
+                if (holdInterval) clearInterval(holdInterval);
+                if (video) {
+                    video.style.filter = "";
+                    video.style.opacity = "";
+                    video.muted = false;
+                    video.play().catch(() => {});
+                }
+            });
+        }
     }
 
     async function waitFor(predicate, { timeout = 10000, interval = 200 } = {}) {
@@ -238,7 +351,7 @@
             setStatus("no captions available", "#e53935");
             return null;
         }
-        const video = document.querySelector("video.html5-main-video");
+        const video = document.querySelector("video.html5-main-video, video");
         if (video?.paused) {
             setStatus("press play to capture", "#ffb74d");
             await new Promise(r => video.addEventListener("play", r, { once: true }));
@@ -352,6 +465,7 @@
     }
 
     async function fetchTranscriptInBrowser(details) {
+        log("fetchTranscriptInBrowser start for", details.videoId);
         setStatus("reading page context...", "#64b5f6");
         const ctx = await getPageContext();
         if (!ctx) { log("page context: bridge timed out"); return null; }
@@ -441,47 +555,141 @@
         });
     }
 
+    function startHold(vid) {
+        if (!vid) return null;
+        vid.pause();
+        vid.muted = true;
+        vid.style.filter = "blur(20px)";
+        vid.style.opacity = "0.4";
+        // Re-enforce every 300ms — YouTube's player fights back
+        const interval = setInterval(() => {
+            if (!vid.paused) vid.pause();
+            if (!vid.muted) vid.muted = true;
+        }, 300);
+        return interval;
+    }
+
+    function liftHold(vid, holdInterval) {
+        if (holdInterval) clearInterval(holdInterval);
+        if (!vid) return;
+        vid.style.filter = "";
+        vid.style.opacity = "";
+        vid.muted = false;
+        vid.play().catch(() => {});
+    }
+
+    function applyResult(result, config, vid, holdInterval) {
+        if (!result || !result.ok || typeof result.score !== "number") {
+            liftHold(vid, holdInterval);
+            setStatus("no score", "#888");
+            return;
+        }
+        showScore(result.score);
+        if (result.score >= config.threshold) {
+            setStatus(`score ${result.score} — blocked`, "#e53935");
+            applyBlock(result.score, config, vid, holdInterval);
+        } else {
+            liftHold(vid, holdInterval);
+            setStatus(`score ${result.score}`, "#81c784");
+        }
+    }
+
     async function run() {
         const videoId = getVideoId();
         if (!videoId) return;
         if (videoId === lastVideoId) return;
+
+        // Cancel server-side Ollama for the video we're leaving
+        const prevVideoId = lastVideoId;
         lastVideoId = videoId;
         captureAbort?.abort();
         captureAbort = new AbortController();
         const signal = captureAbort.signal;
         clearOverlays();
 
-        log("run start for videoId", videoId, "GM_XHR:", !!GM_XHR);
+        if (prevVideoId) {
+            serverRequest("/cancel", { videoId: prevVideoId }, 2000).catch(() => {});
+        }
 
-        const player = await waitFor(() => document.querySelector(".html5-video-player"));
-        if (!player) { setStatus("no player", "#e53935"); return; }
-        await waitFor(() => document.querySelector("video.html5-main-video"));
+        await waitFor(() => document.querySelector("video"));
+        if (signal.aborted) return;
+        const player = getPlayer();
+        if (!player) return;
 
-        const details = getVideoDetailsFromDOM();
-        log("video details:", safeStringify(details));
+        const vid = document.querySelector("video");
+        const holdInterval = startHold(vid);
+        setStatus("checking...", "#64b5f6");
 
-        let result = await fetchTranscriptInBrowser(details);
-        // TEMP: python + DOM fallbacks disabled to verify browser path end-to-end
-        // if (!result || !result.ok) {
-        //     log("browser path failed, trying server-side python");
-        //     result = await tryServerFetch(details);
-        // }
-        // if (!result || !result.ok) {
-        //     log("server returned no-transcript:", result?.error, result?.detail || "");
-        //     result = await fallbackDOMCapture(details, signal);
-        // }
+        // ── Phase 1: instant title keyword score (<50ms) ──────────────────────
+        const [details, config] = await Promise.all([
+            Promise.resolve(getVideoDetailsFromDOM()),
+            fetchConfig(),
+        ]);
+        if (signal.aborted) { liftHold(vid, holdInterval); return; }
 
-        if (!result || !result.ok) {
-            setStatus("no score available", "#e53935");
+        const quickResult = await serverRequest("/score/quick", {
+            videoId, title: details.title, author: details.author,
+        }, 5000).catch(() => null);
+
+        if (signal.aborted) { liftHold(vid, holdInterval); return; }
+
+        if (quickResult?.scorer === "cache") {
+            // Full cached score — no need for phase 2
+            applyResult(quickResult, config, vid, holdInterval);
             return;
         }
 
-        log("scored:", safeStringify(result));
-        setStatus(`${result.captionCount || 0} segments, score ${result.score}`, "#81c784");
-        if (typeof result.score === "number") showScore(result.score);
+        if (quickResult?.ok && quickResult.score >= config.threshold) {
+            // Title alone is damning — block immediately, skip transcript
+            log("phase1 block:", quickResult.score, details.title);
+            applyResult(quickResult, config, vid, holdInterval);
+            return;
+        }
+
+        // Title looks ok — release the hold and let the video play
+        // Phase 2 runs silently and will intervene only if transcript score is high
+        liftHold(vid, holdInterval);
+        setStatus(`title ${quickResult?.score ?? "?"} — verifying...`, "#aaa");
+
+        // ── Phase 2: wait 4s, then score transcript in background ──────────────
+        await new Promise(r => setTimeout(r, 4000));
+        if (signal.aborted) return;
+
+        let result = await fetchTranscriptInBrowser(details);
+        if (signal.aborted) return;
+        if (!result || !result.ok) {
+            result = await fallbackDOMCapture(details, signal);
+        }
+        if (signal.aborted) return;
+
+        // Phase 2 result — only block if score is high, otherwise just show badge
+        if (!result || !result.ok) {
+            setStatus("no transcript", "#888");
+            return;
+        }
+        showScore(result.score);
+        if (result.score >= config.threshold) {
+            log("phase2 block:", result.score, details.title);
+            setStatus(`score ${result.score} — blocked`, "#e53935");
+            const currentVid = document.querySelector("video");
+            const newHold = startHold(currentVid);
+            applyBlock(result.score, config, currentVid, newHold);
+        } else {
+            setStatus(`score ${result.score}`, "#81c784");
+        }
     }
 
     document.addEventListener("yt-navigate-finish", () => { run().catch(e => log("run error:", e.message)); });
     window.addEventListener("popstate", () => { run().catch(e => log("run error:", e.message)); });
+
+    // Poll for URL changes — catches Shorts navigation which doesn't fire yt-navigate-finish
+    let _lastHref = location.href;
+    setInterval(() => {
+        if (location.href !== _lastHref) {
+            _lastHref = location.href;
+            run().catch(e => log("run error:", e.message));
+        }
+    }, 1000);
+
     run().catch(e => log("run error:", e.message));
 })();
