@@ -6,6 +6,19 @@ services:
       - "8787:8787"
     env_file:
       - .env
+    environment:
+      SAFARI_USERSCRIPTS_DIR: ${SAFARI_USERSCRIPTS_DIR:-}
     volumes:
       - ./server/ingest-log:/app/ingest-log
+      - ./userscript:/app/userscript-src:ro
+      - ${SAFARI_USERSCRIPTS_DIR:-/var/empty}:/app/safari-scripts
+    command: >
+      sh -c 'if [ -n "$$SAFARI_USERSCRIPTS_DIR" ]; then
+        cp /app/userscript-src/brainrot.user.js /app/safari-scripts/ \
+          && echo "[sync] userscript -> host Safari dir" \
+          || echo "[sync] copy failed (path mounted but not writable?)";
+      else
+        echo "[sync] SAFARI_USERSCRIPTS_DIR not set, skipping userscript sync";
+      fi;
+      exec node index.js'
     restart: unless-stopped

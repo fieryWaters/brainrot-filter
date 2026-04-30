@@ -62,14 +62,14 @@ Then install the userscript in Safari (see below) and open a YouTube video.
 
 ### Userscript on Mac Safari
 
-After editing `userscript/brainrot.user.js`:
+`SERVER` in `userscript/brainrot.user.js` is set to `http://localhost:8787` by default.
 
-```
-./sync-userscript.sh
-```
+For auto-sync on every `docker compose up`, uncomment `SAFARI_USERSCRIPTS_DIR` in
+`.env`. The container copies `userscript/brainrot.user.js` into the Userscripts
+sandbox each time it starts. Then click the Userscripts toolbar icon in Safari
+and hit Refresh so the extension re-scans.
 
-Click the Userscripts toolbar icon in Safari and hit Refresh so the extension
-re-scans. `SERVER` is set to `http://localhost:8787` by default.
+If you don't want the bind-mount, run `./sync-userscript.sh` manually after edits.
 
 ### Userscript on iPhone Safari
 

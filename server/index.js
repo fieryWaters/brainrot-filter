@@ -1,14 +1,9 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { execFile } = require("child_process");
-const { promisify } = require("util");
-
-const execFileP = promisify(execFile);
 
 const PORT = 8787;
 const LOG_DIR = path.join(__dirname, "ingest-log");
-const TRANSCRIPT_DIR = path.join(__dirname, "transcript");
 
 const OLLAMA_URL = (process.env.OLLAMA_URL || "").trim();
 const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "qwen3.5:9b").trim();
@@ -16,6 +11,7 @@ const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
 const OPENROUTER_MODEL = (process.env.OPENROUTER_MODEL || "qwen/qwen3.5-9b").trim();
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const LLM_TIMEOUT_MS = 120000;
+const TRANSCRIPT_CHAR_LIMIT = 80000;
 
 const PROVIDER = OLLAMA_URL ? "ollama" : (OPENROUTER_API_KEY ? "openrouter" : "none");
 
@@ -26,8 +22,6 @@ const CORS = {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
 };
-
-const transcriptCache = new Map();
 
 function readBody(req, limitBytes = 20 * 1024 * 1024) {
     return new Promise((resolve, reject) => {
@@ -47,25 +41,7 @@ function readBody(req, limitBytes = 20 * 1024 * 1024) {
     });
 }
 
-async function fetchTranscriptPy(videoId) {
-    if (transcriptCache.has(videoId)) return transcriptCache.get(videoId);
-    const { stdout } = await execFileP(
-        "uv",
-        ["run", "python", "main.py", videoId],
-        {
-            cwd: TRANSCRIPT_DIR,
-            maxBuffer: 50 * 1024 * 1024,
-            timeout: 25000,
-        }
-    );
-    const result = JSON.parse(stdout);
-    if (!result.ok) throw new Error(result.error || "python fetch failed");
-    const value = { segments: result.segments, language: result.language };
-    transcriptCache.set(videoId, value);
-    return value;
-}
-
-const SCORING_RULES = `You score a YouTube transcript for "brainrot" on a 0-100 scale. Brainrot = low-effort, hyper-stimulating, addictive content: Gen-Z slang overload (skibidi, rizz, sigma, no cap, etc.), empty filler, clickbait hype, mindless repetition, reaction-bait. Educational, technical, documentary, tutorial, artistic, and thoughtful content scores LOW even if casual. Calm narration scores low. 0 = serious educational. 50 = casual vlog. 100 = pure slop.
+const SCORING_RULES =`You score a YouTube transcript for "brainrot" on a 0-100 scale. Brainrot = low-effort, hyper-stimulating, addictive content: Gen-Z slang overload (skibidi, rizz, sigma, no cap, etc.), empty filler, clickbait hype, mindless repetition, reaction-bait. Educational, technical, documentary, tutorial, artistic, and thoughtful content scores LOW even if casual. Calm narration scores low. 0 = serious educational. 50 = casual vlog. 100 = pure slop.
 
 Respond with ONLY a single integer 0-100. No words, no explanation.`;
 
@@ -77,73 +53,55 @@ function parseScore(raw) {
 }
 
 async function scoreWithOllama(text) {
-    const prompt = `${SCORING_RULES}
-
-TRANSCRIPT:
-${text.slice(0, 80000)}
-
-SCORE:`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
-    try {
-        const res = await fetch(OLLAMA_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                model: OLLAMA_MODEL,
-                prompt,
-                stream: false,
-                think: false,
-                options: { temperature: 0.2, num_predict: 24 },
-            }),
-            signal: controller.signal,
-        });
-        if (!res.ok) throw new Error(`ollama http ${res.status}`);
-        const data = await res.json();
-        return parseScore(data.response);
-    } finally {
-        clearTimeout(timer);
-    }
+    const res = await fetch(OLLAMA_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            model: OLLAMA_MODEL,
+            prompt: `${SCORING_RULES}\n\nTRANSCRIPT:\n${text}\n\nSCORE:`,
+            stream: false,
+            think: false,
+            options: { temperature: 0.2, num_predict: 24 },
+        }),
+        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`ollama http ${res.status}`);
+    const data = await res.json();
+    return parseScore(data.response);
 }
 
 async function scoreWithOpenRouter(text) {
     if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY not set");
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
-    try {
-        const res = await fetch(OPENROUTER_URL, {
-            method: "POST",
-            headers: {
-                "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                model: OPENROUTER_MODEL,
-                messages: [
-                    { role: "system", content: SCORING_RULES },
-                    { role: "user", content: `TRANSCRIPT:\n${text.slice(0, 80000)}\n\nSCORE:` },
-                ],
-                temperature: 0.2,
-                max_tokens: 24,
-                reasoning: { enabled: false },
-            }),
-            signal: controller.signal,
-        });
-        if (!res.ok) {
-            const body = await res.text().catch(() => "");
-            throw new Error(`openrouter http ${res.status}: ${body.slice(0, 200)}`);
-        }
-        const data = await res.json();
-        const content = data?.choices?.[0]?.message?.content || "";
-        return parseScore(content);
-    } finally {
-        clearTimeout(timer);
+    const res = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            model: OPENROUTER_MODEL,
+            messages: [
+                { role: "system", content: SCORING_RULES },
+                { role: "user", content: `TRANSCRIPT:\n${text}\n\nSCORE:` },
+            ],
+            temperature: 0.2,
+            max_tokens: 24,
+            reasoning: { enabled: false },
+        }),
+        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`openrouter http ${res.status}: ${body.slice(0, 200)}`);
     }
+    const data = await res.json();
+    return parseScore(data?.choices?.[0]?.message?.content || "");
 }
 
 async function scoreLLM(text) {
-    if (PROVIDER === "ollama") return { score: await scoreWithOllama(text), scorer: "ollama" };
-    if (PROVIDER === "openrouter") return { score: await scoreWithOpenRouter(text), scorer: "openrouter" };
+    const truncated = text.slice(0, TRANSCRIPT_CHAR_LIMIT);
+    if (PROVIDER === "ollama") return { score: await scoreWithOllama(truncated), scorer: "ollama" };
+    if (PROVIDER === "openrouter") return { score: await scoreWithOpenRouter(truncated), scorer: "openrouter" };
     throw new Error("no LLM provider configured (set OPENROUTER_API_KEY or OLLAMA_URL)");
 }
 
@@ -224,9 +182,8 @@ const server = http.createServer(async (req, res) => {
         let language = payload.language || null;
 
         if (captions.length === 0) {
-            // TEMP: python path disabled to verify browser path end-to-end
-            console.log(`[transcript] python path disabled; refusing empty payload for ${videoId}`);
-            send(200, { ok: false, error: "python-disabled", videoId });
+            console.log(`[ingest] ${videoId} no captions in payload`);
+            send(200, { ok: false, error: "no-captions", videoId });
             return;
         }
 
