@@ -163,52 +163,50 @@
         if (!m) return null;
 
         const contentId = `ig_${m[1]}`;
-
-        // Scope selectors to `article` — the unscoped ._aade can hit the "Follow" button
-        const article = document.querySelector("article");
-        const captionEl =
-            article?.querySelector('._aade') ||
-            article?.querySelector('h1') ||
-            article?.querySelector('[class*="Caption"] span') ||
-            article?.querySelector('ul li span[dir="auto"]');
-        const title = captionEl?.textContent?.trim() ||
-            document.title.replace(/ • Instagram.*$/, "").trim();
-
-        const usernameEl =
-            article?.querySelector('header a[role="link"]') ||
-            article?.querySelector('header h2 a') ||
-            document.querySelector('header a.notranslate');
-        const author = usernameEl?.textContent?.trim() || "";
+        const { title, author } = extractInstagramText(document.body);
 
         return { contentId, title, author, text: title };
     }
 
-    // Extract caption/author for a specific video element in the Instagram feed
-    function getInstagramVideoContext(videoEl) {
-        // Walk up to the nearest article container (post boundary)
-        let el = videoEl.parentElement;
-        let depth = 0;
-        while (el && el !== document.body && depth < 25) {
-            if (el.tagName === "ARTICLE") break;
-            el = el.parentElement;
-            depth++;
-        }
-        const article = (el && el.tagName === "ARTICLE") ? el : null;
+    // Shared Instagram text extraction — works for both feed and post pages.
+    // Instagram obfuscates all class names and changes them frequently.
+    // The one stable signal: Instagram always adds dir="auto" to user-generated text.
+    function extractInstagramText(searchRoot) {
+        const dirAuto = Array.from(searchRoot.querySelectorAll('[dir="auto"]'));
+        // Pick the candidate with the most text — captions are longer than usernames/buttons
+        const candidates = dirAuto
+            .map(el => el.textContent.trim())
+            .filter(t => t.length > 3 && t.length < 2200);
+        candidates.sort((a, b) => b.length - a.length);
+        const title = candidates[0] || document.title.replace(/ • Instagram.*$/, "").trim();
+        // Username is usually the shortest non-trivial dir="auto" element
+        const author = candidates.find(t => t !== title && t.length < 60) || "";
+        return { title, author };
+    }
 
-        // Try to get stable shortcode from a post link inside this article
-        const postLink = article?.querySelector('a[href*="/p/"], a[href*="/reel/"]');
+    // Extract caption/author for a specific video element in the Instagram feed.
+    // Uses proximity: finds dir="auto" elements that are spatially close to the video.
+    function getInstagramVideoContext(videoEl) {
+        const vr = videoEl.getBoundingClientRect();
+
+        // Find all dir="auto" elements and rank by proximity to the video
+        const candidates = Array.from(document.querySelectorAll('[dir="auto"]'))
+            .map(el => {
+                const r = el.getBoundingClientRect();
+                const t = el.textContent.trim();
+                const dist = Math.abs(r.top - vr.bottom) + Math.abs(r.left - vr.left);
+                return { t, dist, el };
+            })
+            .filter(({ t }) => t.length > 3 && t.length < 2200)
+            .sort((a, b) => a.dist - b.dist);
+
+        const title = candidates[0]?.t || "";
+        const author = candidates.find(({ t }) => t !== title && t.length < 60)?.t || "";
+
+        // Shortcode from any post link nearby
+        const postLink = document.querySelector('a[href*="/p/"], a[href*="/reel/"]');
         const shortcodeM = postLink?.getAttribute("href")?.match(/\/(?:p|reel)\/([a-zA-Z0-9_-]+)/);
         const shortcode = shortcodeM?.[1];
-
-        const captionEl =
-            article?.querySelector('._aade') ||
-            article?.querySelector('[class*="Caption"] span') ||
-            article?.querySelector('ul li span[dir="auto"]') ||
-            article?.querySelector('h2');
-        const title = captionEl?.textContent?.trim() || "";
-
-        const usernameEl = article?.querySelector('header a[role="link"]') || article?.querySelector('header h2 a');
-        const author = usernameEl?.textContent?.trim() || "";
 
         const contentId = shortcode
             ? `ig_${shortcode}`
@@ -405,12 +403,9 @@
         if (!player) return;
 
         video = video || document.querySelector("video");
-        if (video) {
-            video.pause();
-            video.muted = true;
-            video.style.filter = "blur(20px)";
-            video.style.opacity = "0.4";
-        }
+        // startHold sets up the 200ms re-enforce interval; if caller already passed one,
+        // we create a fresh one here so applyBlock is self-contained
+        const blockInterval = startHold(video);
 
         let overlay = document.getElementById(BLOCK_ID);
         if (!overlay) {
@@ -423,9 +418,9 @@
                 flexDirection: "column",
                 alignItems: "center",
                 justifyContent: "center",
-                background: "rgba(0,0,0,0.82)",
+                background: "rgba(0,0,0,0.90)",
                 color: "#fff",
-                zIndex: "70",
+                zIndex: "9999",
                 textAlign: "center",
                 padding: "24px",
                 boxSizing: "border-box",
@@ -456,6 +451,7 @@
             document.getElementById("brainrot-override-btn")?.addEventListener("click", () => {
                 overlay.remove();
                 if (holdInterval) clearInterval(holdInterval);
+                if (blockInterval) clearInterval(blockInterval);
                 if (video) {
                     video.style.filter = "";
                     video.style.opacity = "";
@@ -468,17 +464,22 @@
 
     // ── Video hold ────────────────────────────────────────────────────────────
 
+    const BLUR_FILTER = "blur(40px)";
+    const BLUR_OPACITY = "0.08";
+
     function startHold(vid) {
         if (!vid) return null;
         vid.pause();
         vid.muted = true;
-        vid.style.filter = "blur(20px)";
-        vid.style.opacity = "0.4";
-        // Re-enforce every 300ms — YouTube's player fights back
+        vid.style.filter = BLUR_FILTER;
+        vid.style.opacity = BLUR_OPACITY;
+        // Re-enforce every 200ms — players (YouTube, Reddit, etc.) fight back
         const interval = setInterval(() => {
             if (!vid.paused) vid.pause();
             if (!vid.muted) vid.muted = true;
-        }, 300);
+            if (vid.style.filter !== BLUR_FILTER) vid.style.filter = BLUR_FILTER;
+            if (vid.style.opacity !== BLUR_OPACITY) vid.style.opacity = BLUR_OPACITY;
+        }, 200);
         return interval;
     }
 
@@ -822,6 +823,116 @@
         }
     }
 
+    // ── Reddit feed observer ──────────────────────────────────────────────────
+    //
+    // When browsing /r/all, /r/funny, etc., the URL doesn't change per post.
+    // We watch for post card elements entering the viewport and score each title.
+
+    function applyRedditFeedScore(postEl, score, config) {
+        // Idempotent — remove any existing badge first
+        postEl.querySelector(".br-feed-badge")?.remove();
+
+        const hue = Math.round(120 - (score / 100) * 120);
+        const badge = document.createElement("div");
+        badge.className = "br-feed-badge";
+        Object.assign(badge.style, {
+            padding: "2px 8px",
+            margin: "4px 0 2px",
+            display: "inline-block",
+            background: `hsl(${hue}, 60%, 18%)`,
+            color: `hsl(${hue}, 80%, 65%)`,
+            borderRadius: "4px",
+            font: "600 11px -apple-system, sans-serif",
+            letterSpacing: ".03em",
+        });
+        badge.textContent = `brainrot ${score}/100`;
+
+        // Try to add badge below the post title
+        const titleEl = postEl.querySelector('[slot="title"], h3, h1, [id^="post-title"]');
+        if (titleEl) {
+            titleEl.insertAdjacentElement("afterend", badge);
+        } else {
+            postEl.prepend(badge);
+        }
+
+        if (score >= config.threshold) {
+            // Dim the whole card and blur any media thumbnails
+            postEl.style.opacity = "0.45";
+            postEl.querySelectorAll("img, video, [slot='thumbnail']").forEach(m => {
+                m.style.filter = "blur(10px)";
+            });
+        } else {
+            // Color-coded left border for at-a-glance quality
+            postEl.style.borderLeft = `3px solid hsl(${hue}, 60%, 40%)`;
+        }
+    }
+
+    function setupRedditFeedObserver() {
+        if (!location.hostname.includes("reddit.com")) return;
+        // Only on feed pages, not individual post pages
+        if (location.pathname.match(/\/r\/[^/]+\/comments\//)) return;
+
+        const scored = new Set();
+
+        const scorePost = async (postEl) => {
+            const titleEl = postEl.querySelector('[slot="title"], h3, h1, [id^="post-title"]');
+            const title = titleEl?.textContent?.trim() || "";
+            if (!title) return;
+
+            // Extract post ID from a /comments/ link inside the card
+            const linkEl = postEl.querySelector('a[href*="/comments/"]');
+            const idM = linkEl?.getAttribute("href")?.match(/\/comments\/([a-zA-Z0-9]+)/);
+            const contentId = idM ? `reddit_${idM[1]}` : `reddit_feed_${simpleHash(title)}`;
+
+            if (scored.has(contentId)) return;
+            scored.add(contentId);
+
+            const subredditEl = postEl.querySelector('a[href^="/r/"]');
+            const subreddit = subredditEl?.textContent?.replace(/^r\//, "").trim() || "";
+
+            const config = await fetchConfig();
+
+            const quickResult = await serverRequest("/score/quick", {
+                videoId: contentId, title, author: subreddit,
+            }, 5000).catch(() => null);
+
+            if (!quickResult) return;
+            applyRedditFeedScore(postEl, quickResult.score || 0, config);
+            if (quickResult.scorer === "cache" || (quickResult.score || 0) >= config.threshold) return;
+
+            // Phase 2: LLM score the title in background
+            const result = await scoreWithDescriptionText({
+                contentId, title, author: subreddit,
+                text: `${title} (r/${subreddit})`,
+            }).catch(() => null);
+
+            if (result?.ok && typeof result.score === "number") {
+                applyRedditFeedScore(postEl, result.score, config);
+            }
+        };
+
+        const intersectionObserver = new IntersectionObserver((entries) => {
+            for (const entry of entries) {
+                if (!entry.isIntersecting) continue;
+                intersectionObserver.unobserve(entry.target);
+                scorePost(entry.target).catch(e => log("reddit feed score error:", e.message));
+            }
+        }, { threshold: 0.1 });
+
+        const watchNewPosts = () => {
+            document.querySelectorAll(
+                "shreddit-post:not([data-br-watched]), [data-testid='post-container']:not([data-br-watched])"
+            ).forEach(el => {
+                el.setAttribute("data-br-watched", "1");
+                intersectionObserver.observe(el);
+            });
+        };
+
+        const mutationObserver = new MutationObserver(watchNewPosts);
+        mutationObserver.observe(document.body, { childList: true, subtree: true });
+        watchNewPosts();
+    }
+
     // ── Instagram feed observer ───────────────────────────────────────────────
     //
     // The home feed (/) and Reels tab (/reels/) don't update the URL per post,
@@ -921,4 +1032,5 @@
 
     run().catch(e => log("run error:", e.message));
     setupInstagramFeedObserver();
+    setupRedditFeedObserver();
 })();
