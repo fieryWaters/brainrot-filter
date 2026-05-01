@@ -158,26 +158,61 @@
 
     function getInstagramDetails() {
         // Reels: /reel/ID/    Posts: /p/ID/
+        // Feed pages (/, /reels/, /explore/) are handled by setupInstagramFeedObserver
         const m = location.pathname.match(/\/(?:reel|p)\/([a-zA-Z0-9_-]+)/);
         if (!m) return null;
 
         const contentId = `ig_${m[1]}`;
 
-        // Instagram obfuscates class names — use structural and stable selectors
+        // Scope selectors to `article` — the unscoped ._aade can hit the "Follow" button
+        const article = document.querySelector("article");
         const captionEl =
-            document.querySelector('._aade') ||                         // current
-            document.querySelector('article h1') ||                     // older layout
-            document.querySelector('[class*="Caption"] span') ||        // legacy
-            document.querySelector('ul li span[class]');                // fallback
+            article?.querySelector('._aade') ||
+            article?.querySelector('h1') ||
+            article?.querySelector('[class*="Caption"] span') ||
+            article?.querySelector('ul li span[dir="auto"]');
         const title = captionEl?.textContent?.trim() ||
             document.title.replace(/ • Instagram.*$/, "").trim();
 
-        // Username: article header → first link
         const usernameEl =
-            document.querySelector('article header a[role="link"]') ||
-            document.querySelector('article header h2 a') ||
+            article?.querySelector('header a[role="link"]') ||
+            article?.querySelector('header h2 a') ||
             document.querySelector('header a.notranslate');
         const author = usernameEl?.textContent?.trim() || "";
+
+        return { contentId, title, author, text: title };
+    }
+
+    // Extract caption/author for a specific video element in the Instagram feed
+    function getInstagramVideoContext(videoEl) {
+        // Walk up to the nearest article container (post boundary)
+        let el = videoEl.parentElement;
+        let depth = 0;
+        while (el && el !== document.body && depth < 25) {
+            if (el.tagName === "ARTICLE") break;
+            el = el.parentElement;
+            depth++;
+        }
+        const article = (el && el.tagName === "ARTICLE") ? el : null;
+
+        // Try to get stable shortcode from a post link inside this article
+        const postLink = article?.querySelector('a[href*="/p/"], a[href*="/reel/"]');
+        const shortcodeM = postLink?.getAttribute("href")?.match(/\/(?:p|reel)\/([a-zA-Z0-9_-]+)/);
+        const shortcode = shortcodeM?.[1];
+
+        const captionEl =
+            article?.querySelector('._aade') ||
+            article?.querySelector('[class*="Caption"] span') ||
+            article?.querySelector('ul li span[dir="auto"]') ||
+            article?.querySelector('h2');
+        const title = captionEl?.textContent?.trim() || "";
+
+        const usernameEl = article?.querySelector('header a[role="link"]') || article?.querySelector('header h2 a');
+        const author = usernameEl?.textContent?.trim() || "";
+
+        const contentId = shortcode
+            ? `ig_${shortcode}`
+            : `ig_feed_${simpleHash((title || "") + (author || "") + (videoEl.src || "").slice(-30))}`;
 
         return { contentId, title, author, text: title };
     }
@@ -254,12 +289,7 @@
         return 0;
     }
 
-    function getPlayer() {
-        // Desktop YouTube
-        const desktop = document.querySelector(".html5-video-player");
-        if (desktop) return desktop;
-        // Mobile / all other platforms — walk up from <video> to find a sized container
-        const video = document.querySelector("video");
+    function getPlayerForVideo(video) {
         if (!video) return null;
         let el = video.parentElement;
         while (el && el !== document.body) {
@@ -271,6 +301,27 @@
             el = el.parentElement;
         }
         return video.parentElement;
+    }
+
+    function getPlayer() {
+        // Desktop YouTube
+        const desktop = document.querySelector(".html5-video-player");
+        if (desktop) return desktop;
+        // All other platforms — walk up from <video>
+        const video = document.querySelector("video");
+        if (video) return getPlayerForVideo(video);
+        // No video — use post container (Reddit text posts, etc.)
+        const postContainer =
+            document.querySelector("shreddit-post") ||
+            document.querySelector('[data-testid="post-container"]') ||
+            document.querySelector("main article");
+        if (postContainer) {
+            if (getComputedStyle(postContainer).position === "static") {
+                postContainer.style.position = "relative";
+            }
+            return postContainer;
+        }
+        return null;
     }
 
     async function waitFor(predicate, { timeout = 10000, interval = 200 } = {}) {
@@ -454,6 +505,14 @@
             if (vid) liftHold(vid, holdInterval);
             setStatus(`score ${result.score}`, "#81c784");
         }
+    }
+
+    // ── Utilities ─────────────────────────────────────────────────────────────
+
+    function simpleHash(s) {
+        let h = 0;
+        for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+        return Math.abs(h).toString(36);
     }
 
     // ── Non-YouTube Phase 2: score description text via /ingest ───────────────
@@ -763,6 +822,87 @@
         }
     }
 
+    // ── Instagram feed observer ───────────────────────────────────────────────
+    //
+    // The home feed (/) and Reels tab (/reels/) don't update the URL per post,
+    // so URL polling never fires. Instead we watch for videos entering the viewport.
+
+    function setupInstagramFeedObserver() {
+        // Only run on Instagram feed pages — individual post pages are handled by run()
+        if (!location.hostname.includes("instagram.com")) return;
+        if (location.pathname.match(/\/(?:reel|p)\/[a-zA-Z0-9_-]+/)) return;
+
+        let debounceTimer = null;
+
+        const scoreVisibleVideo = async (vid) => {
+            const ctx = getInstagramVideoContext(vid);
+            if (!ctx?.contentId || ctx.contentId === lastVideoId) return;
+
+            lastVideoId = ctx.contentId;
+            clearOverlays();
+            captureAbort?.abort();
+            captureAbort = new AbortController();
+            const signal = captureAbort.signal;
+
+            const holdInterval = startHold(vid);
+            const config = await fetchConfig();
+            if (signal.aborted) { liftHold(vid, holdInterval); return; }
+
+            const quickResult = await serverRequest("/score/quick", {
+                videoId: ctx.contentId, title: ctx.title, author: ctx.author,
+            }, 5000).catch(() => null);
+            if (signal.aborted) { liftHold(vid, holdInterval); return; }
+
+            if (quickResult?.scorer === "cache" || (quickResult?.ok && quickResult.score >= config.threshold)) {
+                applyResult(quickResult, config, vid, holdInterval);
+                return;
+            }
+
+            liftHold(vid, holdInterval);
+            setStatus(`title ${quickResult?.score ?? "?"} — verifying...`, "#aaa");
+
+            await new Promise(r => setTimeout(r, 1500));
+            if (signal.aborted) return;
+
+            const latestCtx = getInstagramVideoContext(vid) || ctx;
+            const result = await scoreWithDescriptionText(latestCtx).catch(() => null);
+            if (signal.aborted) return;
+
+            if (!result?.ok) { setStatus("no score", "#888"); return; }
+            showScore(result.score);
+            if (result.score >= config.threshold) {
+                log(`[instagram-feed] block: ${result.score} "${latestCtx.title.slice(0, 60)}"`);
+                setStatus(`score ${result.score} — blocked`, "#e53935");
+                const newHold = startHold(vid);
+                applyBlock(result.score, config, vid, newHold);
+            } else {
+                setStatus(`score ${result.score}`, "#81c784");
+            }
+        };
+
+        const intersectionObserver = new IntersectionObserver((entries) => {
+            for (const entry of entries) {
+                if (!entry.isIntersecting || entry.intersectionRatio < 0.5) continue;
+                const vid = entry.target;
+                // Debounce: wait for the user to settle on a reel before scoring
+                if (debounceTimer) clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => scoreVisibleVideo(vid).catch(e => log("feed score error:", e.message)), 600);
+                break;
+            }
+        }, { threshold: 0.5 });
+
+        const watchNewVideos = () => {
+            document.querySelectorAll("video:not([data-br-watched])").forEach(vid => {
+                vid.setAttribute("data-br-watched", "1");
+                intersectionObserver.observe(vid);
+            });
+        };
+
+        const mutationObserver = new MutationObserver(watchNewVideos);
+        mutationObserver.observe(document.body, { childList: true, subtree: true });
+        watchNewVideos();
+    }
+
     // ── Navigation event listeners ────────────────────────────────────────────
 
     // YouTube's own navigation event (SPA)
@@ -780,4 +920,5 @@
     }, 1000);
 
     run().catch(e => log("run error:", e.message));
+    setupInstagramFeedObserver();
 })();
