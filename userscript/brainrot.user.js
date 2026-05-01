@@ -1,9 +1,13 @@
 // ==UserScript==
-// @name         Brainrot Filter POC
+// @name         Brainrot Filter
 // @namespace    brainrot-filter
-// @version      0.9.0
-// @description  Fetch transcripts from the browser via YouTube's own get_transcript endpoint so every user hits YouTube with their own IP/cookies; server only scores.
+// @version      1.0.0
+// @description  Score and blur addictive content on YouTube, TikTok, Instagram, Facebook, and Reddit.
 // @match        *://*.youtube.com/*
+// @match        *://*.tiktok.com/*
+// @match        *://*.instagram.com/*
+// @match        *://*.facebook.com/*
+// @match        *://*.reddit.com/*
 // @run-at       document-idle
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
@@ -30,6 +34,8 @@
 
     const GM_XHR = (typeof GM !== "undefined" && GM.xmlHttpRequest) || (typeof GM_xmlhttpRequest !== "undefined" ? GM_xmlhttpRequest : null);
 
+    // ── Server communication ──────────────────────────────────────────────────
+
     function serverRequest(path, payload, timeout = 30000) {
         return new Promise((resolve, reject) => {
             if (!GM_XHR) return reject(new Error("GM.xmlHttpRequest unavailable"));
@@ -50,28 +56,195 @@
         });
     }
 
-    function safeStringify(v) {
-        try { return JSON.stringify(v); } catch (_) { return String(v); }
+    function serverGet(path, timeout = 5000) {
+        return new Promise((resolve, reject) => {
+            if (!GM_XHR) return reject(new Error("GM.xmlHttpRequest unavailable"));
+            GM_XHR({
+                method: "GET",
+                url: `${SERVER}${path}`,
+                timeout,
+                onload: (res) => {
+                    if (res.status < 200 || res.status >= 300) return reject(new Error(`server ${res.status}`));
+                    try { resolve(JSON.parse(res.responseText)); }
+                    catch (_) { resolve({}); }
+                },
+                onerror: (e) => reject(new Error(e?.error || "network error")),
+                ontimeout: () => reject(new Error("timeout")),
+            });
+        });
     }
 
-    function remoteLog(msg) {
-        serverRequest("/log", { msg, videoId: getVideoId(), t: Date.now() }, 5000).catch(() => {});
+    function safeStringify(v) {
+        try { return JSON.stringify(v); } catch (_) { return String(v); }
     }
 
     function log(...args) {
         const parts = args.map(a => typeof a === "string" ? a : safeStringify(a));
         const msg = parts.join(" ");
         console.log("[brainrot]", msg);
-        remoteLog(msg);
+        serverRequest("/log", { msg, videoId: lastVideoId, t: Date.now() }, 5000).catch(() => {});
     }
 
-    function getVideoId() {
-        const u = new URL(location.href);
-        if (u.pathname === "/watch") return u.searchParams.get("v");
-        const shorts = u.pathname.match(/^\/shorts\/([a-zA-Z0-9_-]+)/);
-        if (shorts) return shorts[1];
+    async function fetchConfig() {
+        try {
+            const result = await serverGet("/config", 5000);
+            return result || DEFAULT_CONFIG;
+        } catch (_) {
+            return DEFAULT_CONFIG; // server unreachable → don't block anything
+        }
+    }
+
+    // ── Platform detection ────────────────────────────────────────────────────
+
+    function detectPlatform() {
+        const h = location.hostname;
+        if (h.includes("youtube.com")) return "youtube";
+        if (h.includes("tiktok.com")) return "tiktok";
+        if (h.includes("instagram.com")) return "instagram";
+        if (h.includes("facebook.com") || h.includes("fb.com")) return "facebook";
+        if (h.includes("reddit.com")) return "reddit";
         return null;
     }
+
+    // ── Per-platform content extraction ──────────────────────────────────────
+    //
+    // Each extractor returns: { contentId, title, author, text, lengthSeconds? }
+    // contentId  — unique cache key (prefixed per platform to avoid collisions)
+    // text       — description/caption text for LLM scoring (null for YouTube, uses transcript)
+
+    function getYouTubeDetails() {
+        const u = new URL(location.href);
+        let videoId = null;
+        if (u.pathname === "/watch") videoId = u.searchParams.get("v");
+        const shorts = u.pathname.match(/^\/shorts\/([a-zA-Z0-9_-]+)/);
+        if (shorts) videoId = shorts[1];
+        if (!videoId) return null;
+
+        const titleEl = document.querySelector(
+            "ytd-watch-metadata h1 yt-formatted-string, h1.ytd-watch-metadata yt-formatted-string, h1.title yt-formatted-string, h1.title"
+        );
+        const authorEl = document.querySelector(
+            "ytd-video-owner-renderer ytd-channel-name a, ytd-video-owner-renderer #channel-name a, #owner #channel-name a"
+        );
+        const durEl = document.querySelector(".ytp-time-duration");
+        return {
+            contentId: videoId,
+            title: titleEl?.textContent?.trim() || document.title.replace(/ - YouTube$/, ""),
+            author: authorEl?.textContent?.trim() || "",
+            lengthSeconds: durEl ? parseTimestamp(durEl.textContent) : 0,
+            text: null, // YouTube uses transcript fetching, not description text
+        };
+    }
+
+    function getTikTokDetails() {
+        // Video page URL: /@username/video/VIDEO_ID
+        // For You feed: URL updates to the above as you scroll
+        const m = location.pathname.match(/\/@([^/]+)\/video\/(\d+)/);
+        if (!m) return null;
+
+        const author = m[1];
+        const contentId = `tiktok_${m[2]}`;
+
+        // TikTok's class names change, use data-e2e attributes which are stable
+        const descEl =
+            document.querySelector('[data-e2e="browse-video-desc"]') ||
+            document.querySelector('[data-e2e="video-desc"]') ||
+            document.querySelector('h1[data-e2e="video-title"]') ||
+            document.querySelector('.video-meta-caption');
+        const title = descEl?.textContent?.trim() || document.title.replace(/ \| TikTok$/, "").trim();
+
+        return { contentId, title, author, text: title };
+    }
+
+    function getInstagramDetails() {
+        // Reels: /reel/ID/    Posts: /p/ID/
+        const m = location.pathname.match(/\/(?:reel|p)\/([a-zA-Z0-9_-]+)/);
+        if (!m) return null;
+
+        const contentId = `ig_${m[1]}`;
+
+        // Instagram obfuscates class names — use structural and stable selectors
+        const captionEl =
+            document.querySelector('._aade') ||                         // current
+            document.querySelector('article h1') ||                     // older layout
+            document.querySelector('[class*="Caption"] span') ||        // legacy
+            document.querySelector('ul li span[class]');                // fallback
+        const title = captionEl?.textContent?.trim() ||
+            document.title.replace(/ • Instagram.*$/, "").trim();
+
+        // Username: article header → first link
+        const usernameEl =
+            document.querySelector('article header a[role="link"]') ||
+            document.querySelector('article header h2 a') ||
+            document.querySelector('header a.notranslate');
+        const author = usernameEl?.textContent?.trim() || "";
+
+        return { contentId, title, author, text: title };
+    }
+
+    function getFacebookDetails() {
+        const u = new URL(location.href);
+        // Reels: /reel/ID    Watch: /watch?v=ID or /video/ID
+        const reelM = u.pathname.match(/\/reel\/(\d+)/);
+        const videoM = u.pathname.match(/\/video\/(\d+)/);
+        const videoId = reelM?.[1] || videoM?.[1] || u.searchParams.get("v");
+        if (!videoId) return null;
+
+        const contentId = `fb_${videoId}`;
+
+        // Facebook uses obfuscated atomic class names — target semantic attributes
+        const titleEl =
+            document.querySelector('[role="article"] h2[dir="auto"]') ||
+            document.querySelector('[role="main"] h2[dir="auto"]') ||
+            document.querySelector('h2[dir="auto"]');
+        const title = titleEl?.textContent?.trim() ||
+            document.title.replace(/ \| Facebook$/, "").trim();
+
+        return { contentId, title, author: "", text: title };
+    }
+
+    function getRedditDetails() {
+        // Post pages: /r/subreddit/comments/POST_ID/title_slug/
+        // Feed pages (/r/funny, /r/all) are NOT handled here — would need MutationObserver
+        const m = location.pathname.match(/\/r\/([^/]+)\/comments\/([a-zA-Z0-9]+)/);
+        if (!m) return null;
+
+        const subreddit = m[1];
+        const contentId = `reddit_${m[2]}`;
+
+        // Support both Shreddit (new) and legacy new Reddit
+        const shreddit = document.querySelector("shreddit-post");
+        const titleEl =
+            (shreddit && (shreddit.querySelector('[slot="title"]') || shreddit.querySelector('h1'))) ||
+            document.querySelector('[data-testid="post-title"]') ||
+            document.querySelector('.Post h1') ||
+            document.querySelector('[id^="post-title"]') ||
+            document.querySelector('h1');
+        const title = titleEl?.textContent?.trim() ||
+            document.title.replace(/ : r\/.*$/, "").replace(/ - Reddit$/, "").trim();
+
+        const authorEl =
+            document.querySelector('a[data-testid="post_author_link"]') ||
+            (shreddit && shreddit.querySelector('[slot="authorName"] a')) ||
+            document.querySelector('a[href*="/user/"]');
+        const author = authorEl?.textContent?.trim()?.replace(/^u\//, "") || "";
+
+        // Include subreddit in text so LLM has context (e.g. r/teenagers signals different content than r/science)
+        return { contentId, title, author, text: `${title} (r/${subreddit})`, subreddit };
+    }
+
+    function getPlatformDetails(platform) {
+        switch (platform) {
+            case "youtube":   return getYouTubeDetails();
+            case "tiktok":    return getTikTokDetails();
+            case "instagram": return getInstagramDetails();
+            case "facebook":  return getFacebookDetails();
+            case "reddit":    return getRedditDetails();
+            default:          return null;
+        }
+    }
+
+    // ── DOM utilities ─────────────────────────────────────────────────────────
 
     function parseTimestamp(ts) {
         const parts = (ts || "").trim().split(":").map(Number);
@@ -81,29 +254,11 @@
         return 0;
     }
 
-    function getVideoDetailsFromDOM() {
-        const vid = getVideoId();
-        const titleEl = document.querySelector(
-            "ytd-watch-metadata h1 yt-formatted-string, h1.ytd-watch-metadata yt-formatted-string, h1.title yt-formatted-string, h1.title"
-        );
-        const authorEl = document.querySelector(
-            "ytd-video-owner-renderer ytd-channel-name a, ytd-video-owner-renderer #channel-name a, #owner #channel-name a"
-        );
-        const durEl = document.querySelector(".ytp-time-duration");
-        const lengthSeconds = durEl ? parseTimestamp(durEl.textContent) : 0;
-        return {
-            videoId: vid,
-            title: titleEl?.textContent?.trim() || document.title.replace(/ - YouTube$/, ""),
-            author: authorEl?.textContent?.trim() || "",
-            lengthSeconds,
-        };
-    }
-
     function getPlayer() {
         // Desktop YouTube
         const desktop = document.querySelector(".html5-video-player");
         if (desktop) return desktop;
-        // Mobile YouTube / Shorts — walk up from the video element to find a sized container
+        // Mobile / all other platforms — walk up from <video> to find a sized container
         const video = document.querySelector("video");
         if (!video) return null;
         let el = video.parentElement;
@@ -117,6 +272,18 @@
         }
         return video.parentElement;
     }
+
+    async function waitFor(predicate, { timeout = 10000, interval = 200 } = {}) {
+        const start = Date.now();
+        while (Date.now() - start < timeout) {
+            const v = predicate();
+            if (v) return v;
+            await new Promise(r => setTimeout(r, interval));
+        }
+        return null;
+    }
+
+    // ── UI ────────────────────────────────────────────────────────────────────
 
     function setStatus(text, color) {
         const player = getPlayer();
@@ -182,39 +349,17 @@
         document.getElementById(BLOCK_ID)?.remove();
     }
 
-    function serverGet(path, timeout = 5000) {
-        return new Promise((resolve, reject) => {
-            if (!GM_XHR) return reject(new Error("GM.xmlHttpRequest unavailable"));
-            GM_XHR({
-                method: "GET",
-                url: `${SERVER}${path}`,
-                timeout,
-                onload: (res) => {
-                    if (res.status < 200 || res.status >= 300) return reject(new Error(`server ${res.status}`));
-                    try { resolve(JSON.parse(res.responseText)); }
-                    catch (_) { resolve({}); }
-                },
-                onerror: (e) => reject(new Error(e?.error || "network error")),
-                ontimeout: () => reject(new Error("timeout")),
-            });
-        });
-    }
-
-    async function fetchConfig() {
-        try {
-            const result = await serverGet("/config", 5000);
-            return result || DEFAULT_CONFIG;
-        } catch (_) {
-            return DEFAULT_CONFIG; // server unreachable → don't block anything
-        }
-    }
-
     function applyBlock(score, config, video, holdInterval) {
         const player = getPlayer();
         if (!player) return;
 
-        video = video || document.querySelector("video.html5-main-video, video");
-        if (video) { video.pause(); video.muted = true; video.style.filter = "blur(20px)"; video.style.opacity = "0.4"; }
+        video = video || document.querySelector("video");
+        if (video) {
+            video.pause();
+            video.muted = true;
+            video.style.filter = "blur(20px)";
+            video.style.opacity = "0.4";
+        }
 
         let overlay = document.getElementById(BLOCK_ID);
         if (!overlay) {
@@ -270,26 +415,63 @@
         }
     }
 
-    async function waitFor(predicate, { timeout = 10000, interval = 200 } = {}) {
-        const start = Date.now();
-        while (Date.now() - start < timeout) {
-            const v = predicate();
-            if (v) return v;
-            await new Promise(r => setTimeout(r, interval));
-        }
-        return null;
+    // ── Video hold ────────────────────────────────────────────────────────────
+
+    function startHold(vid) {
+        if (!vid) return null;
+        vid.pause();
+        vid.muted = true;
+        vid.style.filter = "blur(20px)";
+        vid.style.opacity = "0.4";
+        // Re-enforce every 300ms — YouTube's player fights back
+        const interval = setInterval(() => {
+            if (!vid.paused) vid.pause();
+            if (!vid.muted) vid.muted = true;
+        }, 300);
+        return interval;
     }
 
-    async function enableCaptionsIfOff() {
-        const btn = document.querySelector(".ytp-subtitles-button");
-        if (!btn) return { state: "no-button" };
-        const before = btn.getAttribute("aria-pressed");
-        if (before === "true") return { state: "already-on" };
-        btn.click();
-        await new Promise(r => setTimeout(r, CC_SETTLE_MS));
-        const after = btn.getAttribute("aria-pressed");
-        return { state: "clicked", before, after };
+    function liftHold(vid, holdInterval) {
+        if (holdInterval) clearInterval(holdInterval);
+        if (!vid) return;
+        vid.style.filter = "";
+        vid.style.opacity = "";
+        vid.muted = false;
+        vid.play().catch(() => {});
     }
+
+    function applyResult(result, config, vid, holdInterval) {
+        if (!result || !result.ok || typeof result.score !== "number") {
+            if (vid) liftHold(vid, holdInterval);
+            setStatus("no score", "#888");
+            return;
+        }
+        showScore(result.score);
+        if (result.score >= config.threshold) {
+            setStatus(`score ${result.score} — blocked`, "#e53935");
+            applyBlock(result.score, config, vid, holdInterval);
+        } else {
+            if (vid) liftHold(vid, holdInterval);
+            setStatus(`score ${result.score}`, "#81c784");
+        }
+    }
+
+    // ── Non-YouTube Phase 2: score description text via /ingest ───────────────
+
+    async function scoreWithDescriptionText(details) {
+        const text = details.text || "";
+        const captions = text ? [{ tStart: 0, dur: 0, text }] : [];
+        setStatus("scoring...", "#64b5f6");
+        return serverRequest("/ingest", {
+            videoId: details.contentId,
+            title: details.title,
+            author: details.author,
+            captions,
+            source: "description",
+        }, 30000).catch(e => { log("description score failed:", e.message); return null; });
+    }
+
+    // ── YouTube-specific: transcript fetching ─────────────────────────────────
 
     function dedupeStaircase(captions) {
         const out = [];
@@ -307,6 +489,8 @@
             const raw = [];
             let lastText = "";
             const start = Date.now();
+            let timer;
+            const finish = () => { if (timer) clearTimeout(timer); resolve(dedupeStaircase(raw)); };
             const tick = () => {
                 if (signal?.aborted) { finish(); return; }
                 const segs = document.querySelectorAll(".ytp-caption-segment");
@@ -318,40 +502,19 @@
                 if (Date.now() - start >= durationMs) { finish(); return; }
                 timer = setTimeout(tick, POLL_INTERVAL_MS);
             };
-            let timer;
-            const finish = () => {
-                if (timer) clearTimeout(timer);
-                resolve(dedupeStaircase(raw));
-            };
             timer = setTimeout(tick, POLL_INTERVAL_MS);
         });
     }
 
-    async function tryServerFetch(details) {
-        setStatus("fetching full transcript...", "#64b5f6");
-        try {
-            const result = await serverRequest("/ingest", {
-                videoId: details.videoId,
-                title: details.title,
-                author: details.author,
-                lengthSeconds: details.lengthSeconds,
-            });
-            return result;
-        } catch (e) {
-            log("server request failed:", e.message);
-            return { ok: false, error: "server-request-failed" };
-        }
-    }
-
     async function fallbackDOMCapture(details, signal) {
-        log("falling back to live DOM capture");
-        const ccResult = await enableCaptionsIfOff();
-        log("CC toggle:", safeStringify(ccResult));
-        if (ccResult.state === "no-button") {
-            setStatus("no captions available", "#e53935");
-            return null;
+        log("falling back to live DOM caption capture");
+        const btn = document.querySelector(".ytp-subtitles-button");
+        if (!btn) { setStatus("no captions available", "#e53935"); return null; }
+        if (btn.getAttribute("aria-pressed") !== "true") {
+            btn.click();
+            await new Promise(r => setTimeout(r, CC_SETTLE_MS));
         }
-        const video = document.querySelector("video.html5-main-video, video");
+        const video = document.querySelector("video");
         if (video?.paused) {
             setStatus("press play to capture", "#ffb74d");
             await new Promise(r => video.addEventListener("play", r, { once: true }));
@@ -361,19 +524,14 @@
         log("DOM capture got", captions.length, "segments after dedupe");
         if (signal.aborted || captions.length === 0) return null;
         setStatus("scoring...", "#64b5f6");
-        try {
-            return await serverRequest("/ingest", {
-                videoId: details.videoId,
-                title: details.title,
-                author: details.author,
-                lengthSeconds: details.lengthSeconds,
-                captions,
-                source: "dom-capture",
-            });
-        } catch (e) {
-            log("fallback ingest failed:", e.message);
-            return null;
-        }
+        return serverRequest("/ingest", {
+            videoId: details.contentId,
+            title: details.title,
+            author: details.author,
+            lengthSeconds: details.lengthSeconds || 0,
+            captions,
+            source: "dom-capture",
+        }).catch(e => { log("fallback ingest failed:", e.message); return null; });
     }
 
     function getPageContext() {
@@ -414,48 +572,18 @@
             })();`;
             (document.head || document.documentElement).appendChild(s);
             s.remove();
-            setTimeout(() => {
-                window.removeEventListener("message", onMsg);
-                resolve(null);
-            }, 2000);
+            setTimeout(() => { window.removeEventListener("message", onMsg); resolve(null); }, 2000);
         });
-    }
-
-    function parseTranscriptResponse(data) {
-        const actions = data?.actions || [];
-        for (const a of actions) {
-            const segs = a?.updateEngagementPanelAction?.content?.transcriptRenderer
-                ?.content?.transcriptSearchPanelRenderer?.body
-                ?.transcriptSegmentListRenderer?.initialSegments;
-            if (!segs) continue;
-            const out = [];
-            for (const s of segs) {
-                const r = s.transcriptSegmentRenderer;
-                if (!r) continue;
-                const text = (r.snippet?.runs || []).map(x => x.text).join("").trim();
-                if (!text) continue;
-                const startMs = Number(r.startMs || 0);
-                const endMs = Number(r.endMs || 0);
-                out.push({ tStart: startMs / 1000, dur: Math.max(0, (endMs - startMs) / 1000), text });
-            }
-            return out;
-        }
-        return [];
     }
 
     function parseTimedTextXml(xml) {
         const doc = new DOMParser().parseFromString(xml, "text/xml");
         const texts = doc.getElementsByTagName("text");
         const out = [];
-        const stripTags = (s) => s.replace(/<[^>]*>/g, "");
-        const decode = (s) => {
-            const t = document.createElement("textarea");
-            t.innerHTML = s;
-            return t.value;
-        };
+        const decode = (s) => { const t = document.createElement("textarea"); t.innerHTML = s; return t.value; };
         for (const el of texts) {
             const raw = el.textContent || "";
-            const text = stripTags(decode(raw)).trim();
+            const text = decode(raw.replace(/<[^>]*>/g, "")).trim();
             if (!text) continue;
             const tStart = parseFloat(el.getAttribute("start") || "0");
             const dur = parseFloat(el.getAttribute("dur") || "0");
@@ -465,15 +593,10 @@
     }
 
     async function fetchTranscriptInBrowser(details) {
-        log("fetchTranscriptInBrowser start for", details.videoId);
+        log("fetchTranscriptInBrowser start for", details.contentId);
         setStatus("reading page context...", "#64b5f6");
         const ctx = await getPageContext();
-        if (!ctx) { log("page context: bridge timed out"); return null; }
-        log("page context:", safeStringify({
-            hasApiKey: !!ctx.apiKey,
-            clientVersion: ctx.clientVersion,
-        }));
-        if (!ctx.apiKey) return null;
+        if (!ctx?.apiKey) { log("page context: no apiKey"); return null; }
 
         async function callPlayer(clientLabel, clientName, clientVersion, clientNumber, credMode) {
             setStatus(`probing /player (${clientLabel})...`, "#64b5f6");
@@ -488,14 +611,10 @@
                     },
                     body: JSON.stringify({
                         context: { client: { clientName, clientVersion, hl: ctx.hl || "en" } },
-                        videoId: details.videoId,
+                        videoId: details.contentId,
                     }),
                 });
-                if (!res.ok) {
-                    const txt = await res.text().catch(() => "");
-                    log(`player(${clientLabel}) http`, res.status, txt.slice(0, 200));
-                    return null;
-                }
+                if (!res.ok) { log(`player(${clientLabel}) http ${res.status}`); return null; }
                 return await res.json();
             } catch (e) {
                 log(`player(${clientLabel}) fetch failed:`, e.message);
@@ -504,28 +623,22 @@
         }
 
         let playerData = await callPlayer("WEB", "WEB", ctx.clientVersion, 1, "include");
-        let clientUsed = "WEB";
-        let webBaseUrl = null;
         if (playerData) {
             const t = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-            webBaseUrl = t[0]?.baseUrl || null;
+            const webBaseUrl = t[0]?.baseUrl || null;
             const pot = webBaseUrl && webBaseUrl.includes("&exp=xpe");
             log("WEB tracks:", t.length, "POT-gated?", pot);
             if (!t.length || pot) playerData = null;
         }
-        if (!playerData) {
-            playerData = await callPlayer("ANDROID", "ANDROID", "20.10.38", 3, "omit");
-            clientUsed = "ANDROID";
-        }
+        if (!playerData) playerData = await callPlayer("ANDROID", "ANDROID", "20.10.38", 3, "omit");
         if (!playerData) return null;
 
         const tracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
         log("caption tracks:", tracks.length, tracks.map(t => `${t.languageCode}${t.kind === "asr" ? "(asr)" : ""}`).join(","));
         if (tracks.length === 0) return null;
+
         const pick = tracks.find(t => t.languageCode?.startsWith("en")) || tracks[0];
-        let baseUrl = (pick.baseUrl || "").replace("&fmt=srv3", "");
-        const hasPot = baseUrl.includes("&exp=xpe");
-        log("baseUrl POT-gated?", hasPot, "sample:", baseUrl.slice(0, 160));
+        const baseUrl = (pick.baseUrl || "").replace("&fmt=srv3", "");
         if (!baseUrl) return null;
 
         setStatus("fetching timedtext...", "#64b5f6");
@@ -533,11 +646,8 @@
         try {
             const res = await fetch(baseUrl, { credentials: "omit" });
             xml = await res.text();
-            log("timedtext http", res.status, "len", xml.length, "head:", xml.slice(0, 120));
-        } catch (e) {
-            log("timedtext fetch failed:", e.message);
-            return null;
-        }
+            log("timedtext http", res.status, "len", xml.length);
+        } catch (e) { log("timedtext fetch failed:", e.message); return null; }
         if (!xml || xml.length < 40) return null;
 
         const captions = parseTimedTextXml(xml);
@@ -545,63 +655,28 @@
         if (captions.length === 0) return null;
 
         setStatus("scoring...", "#64b5f6");
-        return await serverRequest("/ingest", {
-            videoId: details.videoId,
+        return serverRequest("/ingest", {
+            videoId: details.contentId,
             title: details.title,
             author: details.author,
-            lengthSeconds: details.lengthSeconds,
+            lengthSeconds: details.lengthSeconds || 0,
             captions,
-            source: `browser-${clientUsed.toLowerCase()}-player`,
+            source: "browser-player",
         });
     }
 
-    function startHold(vid) {
-        if (!vid) return null;
-        vid.pause();
-        vid.muted = true;
-        vid.style.filter = "blur(20px)";
-        vid.style.opacity = "0.4";
-        // Re-enforce every 300ms — YouTube's player fights back
-        const interval = setInterval(() => {
-            if (!vid.paused) vid.pause();
-            if (!vid.muted) vid.muted = true;
-        }, 300);
-        return interval;
-    }
-
-    function liftHold(vid, holdInterval) {
-        if (holdInterval) clearInterval(holdInterval);
-        if (!vid) return;
-        vid.style.filter = "";
-        vid.style.opacity = "";
-        vid.muted = false;
-        vid.play().catch(() => {});
-    }
-
-    function applyResult(result, config, vid, holdInterval) {
-        if (!result || !result.ok || typeof result.score !== "number") {
-            liftHold(vid, holdInterval);
-            setStatus("no score", "#888");
-            return;
-        }
-        showScore(result.score);
-        if (result.score >= config.threshold) {
-            setStatus(`score ${result.score} — blocked`, "#e53935");
-            applyBlock(result.score, config, vid, holdInterval);
-        } else {
-            liftHold(vid, holdInterval);
-            setStatus(`score ${result.score}`, "#81c784");
-        }
-    }
+    // ── Main run loop ─────────────────────────────────────────────────────────
 
     async function run() {
-        const videoId = getVideoId();
-        if (!videoId) return;
-        if (videoId === lastVideoId) return;
+        const platform = detectPlatform();
+        if (!platform) return;
 
-        // Cancel server-side Ollama for the video we're leaving
+        const details = getPlatformDetails(platform);
+        if (!details?.contentId) return;
+        if (details.contentId === lastVideoId) return;
+
         const prevVideoId = lastVideoId;
-        lastVideoId = videoId;
+        lastVideoId = details.contentId;
         captureAbort?.abort();
         captureAbort = new AbortController();
         const signal = captureAbort.signal;
@@ -611,78 +686,91 @@
             serverRequest("/cancel", { videoId: prevVideoId }, 2000).catch(() => {});
         }
 
-        await waitFor(() => document.querySelector("video"));
+        // Wait for video element — shorter timeout on non-YouTube (text posts have no video)
+        const vid = await waitFor(() => document.querySelector("video"), {
+            timeout: platform === "youtube" ? 10000 : 3000,
+        });
         if (signal.aborted) return;
-        const player = getPlayer();
-        if (!player) return;
 
-        const vid = document.querySelector("video");
-        const holdInterval = startHold(vid);
+        const holdInterval = vid ? startHold(vid) : null;
         setStatus("checking...", "#64b5f6");
 
-        // ── Phase 1: instant title keyword score (<50ms) ──────────────────────
-        const [details, config] = await Promise.all([
-            Promise.resolve(getVideoDetailsFromDOM()),
+        // Re-read details now (DOM may have settled more since initial check)
+        const [freshDetails, config] = await Promise.all([
+            Promise.resolve(getPlatformDetails(platform) || details),
             fetchConfig(),
         ]);
-        if (signal.aborted) { liftHold(vid, holdInterval); return; }
+        if (signal.aborted) { if (vid) liftHold(vid, holdInterval); return; }
 
+        // ── Phase 1: instant title keyword score (<50ms) ──────────────────────
         const quickResult = await serverRequest("/score/quick", {
-            videoId, title: details.title, author: details.author,
+            videoId: freshDetails.contentId,
+            title: freshDetails.title,
+            author: freshDetails.author,
         }, 5000).catch(() => null);
 
-        if (signal.aborted) { liftHold(vid, holdInterval); return; }
+        if (signal.aborted) { if (vid) liftHold(vid, holdInterval); return; }
 
         if (quickResult?.scorer === "cache") {
-            // Full cached score — no need for phase 2
+            // Full cached score — skip phase 2
             applyResult(quickResult, config, vid, holdInterval);
             return;
         }
 
         if (quickResult?.ok && quickResult.score >= config.threshold) {
-            // Title alone is damning — block immediately, skip transcript
-            log("phase1 block:", quickResult.score, details.title);
+            // Title alone is damning — block immediately
+            log(`[${platform}] phase1 block: ${quickResult.score} "${freshDetails.title.slice(0, 60)}"`);
             applyResult(quickResult, config, vid, holdInterval);
             return;
         }
 
-        // Title looks ok — release the hold and let the video play
-        // Phase 2 runs silently and will intervene only if transcript score is high
-        liftHold(vid, holdInterval);
+        // Title passed — lift hold, let video play while we do background scoring
+        if (vid) liftHold(vid, holdInterval);
         setStatus(`title ${quickResult?.score ?? "?"} — verifying...`, "#aaa");
 
-        // ── Phase 2: wait 4s, then score transcript in background ──────────────
-        await new Promise(r => setTimeout(r, 4000));
+        // ── Phase 2: background content scoring ───────────────────────────────
+        const phase2DelayMs = platform === "youtube" ? 4000 : 2000;
+        await new Promise(r => setTimeout(r, phase2DelayMs));
         if (signal.aborted) return;
 
-        let result = await fetchTranscriptInBrowser(details);
-        if (signal.aborted) return;
-        if (!result || !result.ok) {
-            result = await fallbackDOMCapture(details, signal);
+        let result;
+        if (platform === "youtube") {
+            result = await fetchTranscriptInBrowser(freshDetails);
+            if (signal.aborted) return;
+            if (!result?.ok) result = await fallbackDOMCapture(freshDetails, signal);
+        } else {
+            // Re-read now that the page has had 2s to finish rendering
+            const latestDetails = getPlatformDetails(platform) || freshDetails;
+            result = await scoreWithDescriptionText(latestDetails);
         }
+
         if (signal.aborted) return;
 
-        // Phase 2 result — only block if score is high, otherwise just show badge
-        if (!result || !result.ok) {
-            setStatus("no transcript", "#888");
+        if (!result?.ok) {
+            setStatus("no score", "#888");
             return;
         }
+
         showScore(result.score);
         if (result.score >= config.threshold) {
-            log("phase2 block:", result.score, details.title);
+            log(`[${platform}] phase2 block: ${result.score} "${freshDetails.title.slice(0, 60)}"`);
             setStatus(`score ${result.score} — blocked`, "#e53935");
             const currentVid = document.querySelector("video");
-            const newHold = startHold(currentVid);
+            const newHold = currentVid ? startHold(currentVid) : null;
             applyBlock(result.score, config, currentVid, newHold);
         } else {
             setStatus(`score ${result.score}`, "#81c784");
         }
     }
 
+    // ── Navigation event listeners ────────────────────────────────────────────
+
+    // YouTube's own navigation event (SPA)
     document.addEventListener("yt-navigate-finish", () => { run().catch(e => log("run error:", e.message)); });
+    // Browser back/forward
     window.addEventListener("popstate", () => { run().catch(e => log("run error:", e.message)); });
 
-    // Poll for URL changes — catches Shorts navigation which doesn't fire yt-navigate-finish
+    // URL polling — catches SPA navigation on all platforms (TikTok, Instagram, Reddit, etc.)
     let _lastHref = location.href;
     setInterval(() => {
         if (location.href !== _lastHref) {

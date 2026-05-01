@@ -98,18 +98,20 @@ async function scoreTitleWithOllama(title, author, videoId) {
     return ollamaCall("quick", OLLAMA_MODEL_QUICK, OLLAMA_TIMEOUT_QUICK_MS, prompt, videoId);
 }
 
-// Phase 2 — llama3.2:latest (3b) scores title + full transcript
+// Phase 2 — llama3.2:latest (3b) scores title + full transcript/description
 async function scoreTranscriptWithOllama(text, title, videoId) {
     const titleLine = title ? `TITLE: ${title}\n` : "";
-    const prompt = `Score this YouTube video for "brainrot" from 0 to 100.
+    const prompt = `Score this online video or social media post for "brainrot" from 0 to 100.
 
-BRAINROT (scores HIGH 60-100): reaction content, prank videos, skibidi/rizz/sigma/gyatt slang, rage bait, mindless compilations, meme rap, random animal edits with music, content designed to be addictive with no substance.
+BRAINROT (scores HIGH 60-100): reaction content, prank videos, skibidi/rizz/sigma/gyatt/aura/delulu/looksmaxxing slang, rage bait, mindless compilations, meme rap, random animal edits with music, TikTok/Reels slop, content designed to be addictive with no substance, "story time" drama, outrage bait.
 
-NOT BRAINROT (scores LOW 0-40): educational content, tutorials, documentaries, sports highlights, music performances, vlogs with real narrative, cooking, DIY, news.
+NOT BRAINROT (scores LOW 0-40): educational content, tutorials, documentaries, sports highlights, music performances, vlogs with real narrative, cooking, DIY, news, science, history.
 
-MIDDLE (40-60): casual entertainment, funny videos with some substance, sports reactions.
+MIDDLE (40-60): casual entertainment, funny videos with some substance, sports reactions, general lifestyle content.
 
-${titleLine}TRANSCRIPT (may be in another language):
+Note: the content field may be a YouTube transcript, a TikTok/Instagram description, a Reddit post title, or a Facebook video caption.
+
+${titleLine}CONTENT:
 ${text.slice(0, 40000)}
 
 Reply with ONE number 0-100, nothing else.
@@ -128,13 +130,27 @@ function scoreTitleFast(title = "", author = "") {
         "tralalero", "tralala", "patapim", "tung tung", "bombardiro",
         "orcalero", "capuccino", "italian brainrot", "brrr brrr",
         "slop", "npc", "glazing", "slay", "understood the assignment",
+        // TikTok / Reels era
+        "aura", "delulu", "looksmaxxing", "goonmaxxing", "mogging", "looksmax",
+        "low taper fade", "hawk tuah", "demure", "very mindful", "rent free",
+        "ate that", "it's giving", "main character", "slay queen", "bestie",
+        "unalive", "ate no crumbs", "rizz god", "W rizz", "L rizz",
     ];
     const medSignals = [
         "prank", "reaction", "caught", "wait for it", "pov:", "he doesn't know",
         "compilation", "gone wrong", "exposed", "sus", "part 2", "part 3",
         "you won't believe", "watch till end", "ratio", "touch grass",
+        // Common engagement-bait phrases
+        "follow for more", "like and follow", "link in bio", "check my page",
+        "story time", "tell me why", "this is your sign", "caught in 4k",
+        "the audacity", "repost if", "share if", "comment if", "tag someone",
     ];
-    const tagSpam = ["#fyp", "#foryou", "#viral", "#trending", "#prank", "#reaction", "#brainrot"];
+    const tagSpam = [
+        "#fyp", "#foryou", "#viral", "#trending", "#prank", "#reaction", "#brainrot",
+        // Reels / TikTok / Reddit tag spam
+        "#reels", "#explore", "#shorts", "#tiktok", "#instagram", "#reel",
+        "#explorepage", "#fypage", "#foryoupage",
+    ];
 
     for (const w of highSignals) if (t.includes(w.toLowerCase())) score += 30;
     for (const w of medSignals) if (t.includes(w.toLowerCase())) score += 15;
