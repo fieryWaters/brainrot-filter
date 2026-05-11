@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Brainrot Filter",
+  "version": "1.0.0",
+  "description": "Score and blur addictive content on YouTube, Instagram, Facebook, and Reddit.",
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [{
+    "matches": [
+      "*://*.youtube.com/*",
+      "*://*.instagram.com/*",
+      "*://*.facebook.com/*",
+      "*://*.reddit.com/*"
+    ],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }],
+
+  "permissions": ["storage"],
+
+  "host_permissions": [
+    "http://localhost:8787/*",
+    "https://*.railway.app/*",
+    "https://*.fly.dev/*"
+  ],
+
+  "icons": {
+    "48":  "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}
